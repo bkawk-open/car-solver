@@ -78,7 +78,7 @@ def plot_monocoque(
 if __name__ == "__main__":
     import sys
 
-    from car_solver.solver2d import cantilever_beam, mbb_beam, monocoque_cross_section
+    from car_solver.solver2d import cantilever_beam, mbb_beam, plate_with_hole, monocoque_cross_section
     from car_solver.config import load_config
 
     def on_iter(it, densities, compliance, change):
@@ -102,6 +102,14 @@ if __name__ == "__main__":
         print(f"Final compliance: {history[-1]:.4f}")
         plot_density(densities, 180, 60, "MBB Beam - 2D SIMP", "mbb_density.png")
         plot_convergence(history, "MBB Compliance Convergence", "mbb_convergence.png")
+
+    if mode in ("all", "plate"):
+        print("\nRunning plate with hole optimisation (40x40, vf=0.40)...")
+        densities, history = plate_with_hole(nelx=40, nely=40, on_iteration=on_iter)
+        print(f"Converged in {len(history)} iterations")
+        print(f"Final compliance: {history[-1]:.4f}")
+        plot_density(densities, 40, 40, "Plate with Hole - 2D SIMP", "plate_density.png")
+        plot_convergence(history, "Plate Compliance Convergence", "plate_convergence.png")
 
     if mode in ("all", "monocoque"):
         print("\nRunning monocoque cross-section optimisation...")

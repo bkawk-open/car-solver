@@ -3,12 +3,12 @@
 Solves the minimum compliance problem on a 2D rectangular domain using
 Q4 (4-node quadrilateral) finite elements and the SIMP material model.
 
-Reference test case: cantilever beam with tip load. The optimised result
-should produce a truss-like structure matching known analytical solutions.
+Supports multiple load cases with weighted compliance objective,
+obstacle regions (forced void), and preserved regions (forced solid).
 """
 
 import numpy as np
-from scipy.sparse import coo_matrix, diags, lil_matrix
+from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
 from car_solver.config import Config, SIMPConfig
@@ -121,17 +121,29 @@ class Solver2D:
     def solve(
         self,
         fixed_dofs: np.ndarray,
-        force: np.ndarray,
+        forces: np.ndarray | list[np.ndarray],
+        weights: list[float] | None = None,
         designable: np.ndarray | None = None,
+        obstacle: np.ndarray | None = None,
+        x_init: np.ndarray | None = None,
         on_iteration: callable = None,
     ) -> tuple[np.ndarray, list[float]]:
         """Run SIMP optimisation.
 
         Args:
             fixed_dofs: array of DOF indices with zero displacement.
-            force: global force vector of length ndof.
+            forces: single force vector (ndof,) or list of force vectors
+                for multi-load-case optimisation.
+            weights: weight per load case for compliance sum. Must match
+                length of forces list. Defaults to equal weights.
             designable: boolean mask per element. Non-designable elements
                 stay at their initial density. Defaults to all designable.
+            obstacle: boolean mask per element. Obstacle elements are forced
+                to minimum density (void) every iteration. Obstacles must
+                also be marked non-designable.
+            x_init: initial density per element. Defaults to uniform at
+                volume fraction. Obstacle elements are forced to Emin
+                regardless of x_init.
             on_iteration: callback(iteration, densities, compliance, change)
                 called after each iteration for live visualisation.
 
@@ -140,13 +152,38 @@ class Solver2D:
             array of final element densities.
         """
         nel = self.nelx * self.nely
-        x = np.full(nel, self.volfrac)
-        xphys = x.copy()
 
+        # Normalise forces to list + weights
+        if isinstance(forces, np.ndarray) and forces.ndim == 1:
+            force_list = [forces]
+        else:
+            force_list = list(forces)
+        n_cases = len(force_list)
+
+        if weights is None:
+            weights = [1.0 / n_cases] * n_cases
+        if len(weights) != n_cases:
+            raise ValueError(f"Got {len(weights)} weights for {n_cases} load cases")
+
+        # Element masks
         if designable is None:
             designable = np.ones(nel, dtype=bool)
+        if obstacle is None:
+            obstacle = np.zeros(nel, dtype=bool)
+
+        # Initial densities
+        if x_init is not None:
+            x = x_init.copy()
+        else:
+            x = np.full(nel, self.volfrac)
+        x[obstacle] = 0.001
+        xphys = np.array(self.H @ x / self.Hs).flatten()
+        xphys[obstacle] = 0.001
 
         free_dofs = np.setdiff1d(np.arange(self.ndof), fixed_dofs)
+
+        # Mask for elements that participate in sensitivity calculation
+        active = designable & ~obstacle
 
         compliance_history = []
         change = 1.0
@@ -162,26 +199,44 @@ class Solver2D:
             ).flatten(order="F")
             K = coo_matrix((sK, (self.iK, self.jK)), shape=(self.ndof, self.ndof)).tocsc()
 
-            # Solve Ku = f using sparse LU for numerical stability
+            # Factor once, solve for all load cases
             K_free = K[free_dofs, :][:, free_dofs]
-            f_free = force[free_dofs]
-            u = np.zeros(self.ndof)
             lu = splu(K_free.tocsc())
-            u[free_dofs] = lu.solve(f_free)
 
-            # Element compliance and sensitivity
-            ce = np.zeros(nel)
-            for el in range(nel):
-                ue = u[self.edofMat[el]]
-                ce[el] = ue @ self.KE @ ue
+            # Accumulate weighted compliance and sensitivity across load cases
+            total_compliance = 0.0
+            dc = np.zeros(nel)
+            ce_combined = np.zeros(nel)
 
-            compliance = np.sum(
-                (self.Emin + xphys**self.penalty * (self.E0 - self.Emin)) * ce
-            )
-            compliance_history.append(compliance)
+            for f_vec, w in zip(force_list, weights):
+                u = np.zeros(self.ndof)
+                u[free_dofs] = lu.solve(f_vec[free_dofs])
 
-            dc = -self.penalty * xphys**(self.penalty - 1) * (self.E0 - self.Emin) * ce
-            dv = np.ones(nel)
+                # Element compliance for this load case
+                ce = np.zeros(nel)
+                for el in range(nel):
+                    ue = u[self.edofMat[el]]
+                    ce[el] = ue @ self.KE @ ue
+
+                E_eff = self.Emin + xphys**self.penalty * (self.E0 - self.Emin)
+                case_compliance = np.sum(E_eff * ce)
+                total_compliance += w * case_compliance
+
+                # Sensitivity for this load case (only for active elements)
+                dc_case = np.zeros(nel)
+                dc_case[active] = (
+                    -self.penalty
+                    * xphys[active] ** (self.penalty - 1)
+                    * (self.E0 - self.Emin)
+                    * ce[active]
+                )
+                dc += w * dc_case
+                ce_combined += w * ce
+
+            compliance_history.append(total_compliance)
+
+            dv = np.zeros(nel)
+            dv[active] = 1.0
 
             # Apply density filter to sensitivities
             dc = np.array(self.H @ (dc * xphys / self.Hs)).flatten()
@@ -190,13 +245,15 @@ class Solver2D:
             # Optimality criteria update
             xold = x.copy()
             x = self._oc_update(x, dc, dv, designable)
+            x[obstacle] = 0.001
 
             # Filter densities
             xphys = np.array(self.H @ x / self.Hs).flatten()
+            xphys[obstacle] = 0.001
             change = np.max(np.abs(x - xold))
 
             if on_iteration:
-                on_iteration(iteration, xphys.copy(), compliance, change)
+                on_iteration(iteration, xphys.copy(), total_compliance, change)
 
         return xphys, compliance_history
 
@@ -212,12 +269,13 @@ class Solver2D:
         nel = len(x)
         l1, l2 = 1e-12, 1e9
 
-        # Clamp positive sensitivities to avoid sqrt of negative
-        dc = np.minimum(dc, -1e-12)
+        # For non-active elements dc=0 and dv=0, so ratio is irrelevant.
+        # Clamp dc to small negative to keep sqrt well-defined.
+        dc_safe = np.where(dc < 0, dc, -1e-20)
 
         while (l2 - l1) / (l1 + l2) > 1e-3:
             lmid = 0.5 * (l2 + l1)
-            ratio = np.sqrt(-dc / (dv * lmid + 1e-12))
+            ratio = np.sqrt(-dc_safe / (dv * lmid + 1e-12))
             xnew = np.maximum(
                 0.001,
                 np.maximum(
@@ -225,7 +283,6 @@ class Solver2D:
                     np.minimum(1.0, np.minimum(x + move, x * ratio)),
                 ),
             )
-            # Lock non-designable elements
             xnew[~designable] = x[~designable]
 
             if np.sum(xnew) > self.volfrac * nel:
@@ -258,11 +315,9 @@ def cantilever_beam(
 
     solver = Solver2D(nelx, nely, simp)
 
-    # Fix left edge (all DOFs on x=0 nodes)
     fixed_nodes = np.arange(nely + 1)
     fixed_dofs = np.union1d(2 * fixed_nodes, 2 * fixed_nodes + 1)
 
-    # Point load downward at middle of right edge
     force = np.zeros(solver.ndof)
     load_node = (nelx + 1) * (nely + 1) - 1 - nely // 2
     force[2 * load_node + 1] = -1.0
@@ -278,8 +333,9 @@ def mbb_beam(
 ) -> tuple[np.ndarray, list[float]]:
     """MBB beam - full beam, simply supported.
 
-    Pin support (x+y fixed) at bottom-left, roller (y fixed) at bottom-right.
-    Central top load. Known correct result: arch with diagonal members.
+    Pin support at bottom-left, roller at bottom-right (support pads for
+    numerical stability). Central top load. Known correct result: arch
+    with diagonal members.
     """
     if simp is None:
         simp = SIMPConfig(
@@ -292,27 +348,99 @@ def mbb_beam(
 
     solver = Solver2D(nelx, nely, simp)
 
-    # Support pads: fix y-displacement over a few nodes at each bottom corner
-    # to avoid numerical ill-conditioning from single-point supports.
-    # Pad width scales with grid size (minimum 3 nodes per pad).
     pad = max(3, nelx // 30)
 
-    # Left support pad: bottom-left corner, fix x+y
     left_pad_nodes = np.array([i * (nely + 1) + nely for i in range(pad)])
     left_dofs = np.union1d(2 * left_pad_nodes, 2 * left_pad_nodes + 1)
 
-    # Right support pad: bottom-right corner, fix y only (roller)
     right_pad_nodes = np.array([(nelx - i) * (nely + 1) + nely for i in range(pad)])
     right_dofs = 2 * right_pad_nodes + 1
 
     fixed_dofs = np.union1d(left_dofs, right_dofs)
 
-    # Point load downward at top-centre
     mid_top_node = (nelx // 2) * (nely + 1)
     force = np.zeros(solver.ndof)
     force[2 * mid_top_node + 1] = -1.0
 
     return solver.solve(fixed_dofs, force, on_iteration=on_iteration)
+
+
+def plate_with_hole(
+    nelx: int = 80,
+    nely: int = 80,
+    hole_radius: float = 0.25,
+    simp: SIMPConfig | None = None,
+    on_iteration: callable = None,
+) -> tuple[np.ndarray, list[float]]:
+    """Plate with central circular hole under biaxial tension.
+
+    Quarter-plate with symmetry BCs. The obstacle region (hole) is forced
+    void. Known result: material concentrates around the hole edges at
+    the stress concentration points (top/bottom of hole in each axis).
+    Validates obstacle masking and stress-driven material placement.
+
+    Args:
+        hole_radius: radius as fraction of plate half-width (0-1).
+    """
+    if simp is None:
+        simp = SIMPConfig(
+            penalty=3.0,
+            volume_fraction=0.40,
+            convergence_tolerance=0.01,
+            max_iterations=200,
+            filter_radius=1.5,
+        )
+
+    solver = Solver2D(nelx, nely, simp)
+
+    # Mark circular hole as obstacle
+    nel = nelx * nely
+    obstacle = np.zeros(nel, dtype=bool)
+    designable = np.ones(nel, dtype=bool)
+    cx, cy = 0.0, 0.0  # hole centre at bottom-left (symmetry corner)
+    r = hole_radius * nelx
+
+    for i in range(nelx):
+        for j in range(nely):
+            ex, ey = i + 0.5, j + 0.5  # element centre
+            if np.sqrt((ex - cx)**2 + (ey - cy)**2) < r:
+                el = i * nely + j
+                obstacle[el] = True
+                designable[el] = False
+
+    # Symmetry BCs: fix x on left edge, fix y on bottom edge
+    left_nodes = np.arange(nely + 1)
+    bottom_nodes = np.array([i * (nely + 1) + nely for i in range(nelx + 1)])
+
+    sym_x = 2 * left_nodes      # fix x-displacement on left edge
+    sym_y = 2 * bottom_nodes + 1  # fix y-displacement on bottom edge
+
+    fixed_dofs = np.union1d(sym_x, sym_y)
+
+    # Two load cases for biaxial tension:
+    # 1) Horizontal tension on right edge
+    # 2) Vertical tension on top edge
+    right_nodes = np.array([nelx * (nely + 1) + j for j in range(nely + 1)])
+    top_nodes = np.array([i * (nely + 1) for i in range(nelx + 1)])
+
+    f1 = np.zeros(solver.ndof)
+    load_per_node = 1.0 / len(right_nodes)
+    for n in right_nodes:
+        f1[2 * n] = load_per_node  # x-force on right edge
+
+    f2 = np.zeros(solver.ndof)
+    load_per_node = 1.0 / len(top_nodes)
+    for n in top_nodes:
+        f2[2 * n + 1] = -load_per_node  # y-force on top edge (upward in image = negative y)
+
+    return solver.solve(
+        fixed_dofs,
+        forces=[f1, f2],
+        weights=[0.5, 0.5],
+        designable=designable,
+        obstacle=obstacle,
+        on_iteration=on_iteration,
+    )
 
 
 def monocoque_cross_section(
@@ -335,31 +463,27 @@ def monocoque_cross_section(
         Centreline                    Sill outer edge
         (symmetry)                    (suspension pickup)
 
-    Loads applied:
-    - Vertical at lower-right corner (suspension pickup)
-    - Lateral at lower-right corner
-    - Bending distributed along floor
+    Uses multi-load-case objective with vertical and lateral loads
+    as separate cases, weighted by the config objective weights.
 
     Returns (densities, history, nelx, nely) for plotting.
     """
-    # Scale geometry to element grid
-    # Half-width from centreline to outer sill edge
     half_width_mm = cfg.geometry.front_track_mm / 2
-    # Tub height from floor to scuttle top (approximate as 40% of overall height)
     tub_height_mm = cfg.geometry.overall_height_mm * 0.40
 
-    # Element size: 10mm per element gives good resolution
     element_size_mm = 10.0
     nelx = int(half_width_mm / element_size_mm)
     nely = int(tub_height_mm / element_size_mm)
 
     solver = Solver2D(nelx, nely, cfg.simp)
-
-    # --- Define regions ---
-    designable = np.ones(nelx * nely, dtype=bool)
+    nel = nelx * nely
 
     def elem(ix, iy):
         return ix * nely + iy
+
+    # --- Element masks ---
+    designable = np.ones(nel, dtype=bool)
+    obstacle = np.zeros(nel, dtype=bool)
 
     # Floor: bottom 3 elements, full width (preserved solid)
     floor_thickness = 3
@@ -373,118 +497,55 @@ def monocoque_cross_section(
         for j in range(scuttle_thickness):
             designable[elem(i, j)] = False
 
-    # Cockpit void: inner region is obstacle (forced void)
-    # Cockpit occupies roughly 60% of width from centreline, 70% of height
+    # Cockpit void
     cockpit_x_end = int(nelx * 0.60)
     cockpit_y_start = scuttle_thickness + 2
     cockpit_y_end = nely - floor_thickness - 2
-    obstacle = np.zeros(nelx * nely, dtype=bool)
     for i in range(0, cockpit_x_end):
         for j in range(cockpit_y_start, cockpit_y_end):
             obstacle[elem(i, j)] = True
             designable[elem(i, j)] = False
 
-    # Initialise densities: obstacles start at minimum, preserved at 1.0, rest at volfrac
-    nel = nelx * nely
+    # Initial densities
     x_init = np.full(nel, cfg.simp.volume_fraction)
     x_init[obstacle] = 0.001
     x_init[~designable & ~obstacle] = 1.0
 
     # --- Boundary conditions ---
-    # Symmetry on left edge: fix x-displacement for all left-edge nodes
     left_nodes = np.arange(nely + 1)
-    sym_dofs = 2 * left_nodes  # x-DOFs only
+    sym_dofs = 2 * left_nodes
 
-    # Fix y-displacement along the entire top edge (scuttle connects to
-    # the rest of the monocoque longitudinally - reacted by adjacent sections)
     top_nodes = np.array([i * (nely + 1) for i in range(nelx + 1)])
     top_y_dofs = 2 * top_nodes + 1
 
-    # Pin bottom-left corner fully to prevent rigid body motion
     pin_dofs = np.array([2 * nely, 2 * nely + 1])
 
     fixed_dofs = np.union1d(np.union1d(sym_dofs, top_y_dofs), pin_dofs)
 
-    # --- Apply loads ---
+    # --- Load cases ---
     from car_solver.loads import calculate_load_cases
 
     cases = calculate_load_cases(cfg)
+    pickup_node = (nelx + 1) * (nely + 1) - 1
 
-    force = np.zeros(solver.ndof)
+    # Load case 1: vertical at suspension pickup
+    f_vertical = np.zeros(solver.ndof)
+    f_vertical[2 * pickup_node + 1] = -1.0
 
-    # Suspension pickup: bottom-right corner node
-    pickup_node = (nelx + 1) * (nely + 1) - 1  # bottom-right
-    force[2 * pickup_node + 1] = -1.0  # vertical downward (normalised)
-    force[2 * pickup_node] = (
-        cases.front_left_dynamic.lateral_n / cases.front_left_dynamic.vertical_n
-    )  # lateral as ratio of vertical
+    # Load case 2: lateral at suspension pickup
+    f_lateral = np.zeros(solver.ndof)
+    f_lateral[2 * pickup_node] = 1.0
 
-    # --- Solve with custom initial densities ---
-    # Override the solver's internal initialisation by patching solve
-    original_solve = solver.solve
+    # Weight lateral relative to vertical using actual force ratio
+    lat_ratio = cases.front_left_dynamic.lateral_n / cases.front_left_dynamic.vertical_n
 
-    def solve_with_init(fixed_dofs, force, designable=None, on_iteration=None):
-        nel = solver.nelx * solver.nely
-        x = x_init.copy()
-        xphys = x.copy()
-
-        if designable is None:
-            designable_mask = np.ones(nel, dtype=bool)
-        else:
-            designable_mask = designable
-
-        free_dofs = np.setdiff1d(np.arange(solver.ndof), fixed_dofs)
-        compliance_history = []
-        change = 1.0
-
-        for iteration in range(solver.max_iter):
-            if change < solver.tol and iteration > 1:
-                break
-
-            sK = (
-                (solver.KE.flatten()[np.newaxis]).T
-                * (solver.Emin + xphys**solver.penalty * (solver.E0 - solver.Emin))
-            ).flatten(order="F")
-            K = coo_matrix(
-                (sK, (solver.iK, solver.jK)), shape=(solver.ndof, solver.ndof)
-            ).tocsc()
-
-            K_free = K[free_dofs, :][:, free_dofs]
-            f_free = force[free_dofs]
-            u = np.zeros(solver.ndof)
-            lu = splu(K_free.tocsc())
-            u[free_dofs] = lu.solve(f_free)
-
-            ce = np.zeros(nel)
-            for el in range(nel):
-                ue = u[solver.edofMat[el]]
-                ce[el] = ue @ solver.KE @ ue
-
-            compliance = np.sum(
-                (solver.Emin + xphys**solver.penalty * (solver.E0 - solver.Emin)) * ce
-            )
-            compliance_history.append(compliance)
-
-            dc = -solver.penalty * xphys**(solver.penalty - 1) * (solver.E0 - solver.Emin) * ce
-            dv = np.ones(nel)
-
-            dc = np.array(solver.H @ (dc * xphys / solver.Hs)).flatten()
-            dv = np.array(solver.H @ (dv * xphys / solver.Hs)).flatten()
-
-            xold = x.copy()
-            x = solver._oc_update(x, dc, dv, designable_mask)
-
-            # Force obstacle elements to void
-            x[obstacle] = 0.001
-
-            xphys = np.array(solver.H @ x / solver.Hs).flatten()
-            xphys[obstacle] = 0.001
-            change = np.max(np.abs(x - xold))
-
-            if on_iteration:
-                on_iteration(iteration, xphys.copy(), compliance, change)
-
-        return xphys, compliance_history
-
-    densities, history = solve_with_init(fixed_dofs, force, designable, on_iteration)
+    densities, history = solver.solve(
+        fixed_dofs,
+        forces=[f_vertical, f_lateral],
+        weights=[1.0 / (1.0 + lat_ratio), lat_ratio / (1.0 + lat_ratio)],
+        designable=designable,
+        obstacle=obstacle,
+        x_init=x_init,
+        on_iteration=on_iteration,
+    )
     return densities, history, nelx, nely
