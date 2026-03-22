@@ -104,11 +104,12 @@ if __name__ == "__main__":
         plot_convergence(history, "MBB Compliance Convergence", "mbb_convergence.png")
 
     if mode in ("all", "plate"):
-        print("\nRunning plate with hole optimisation (40x40, vf=0.40)...")
-        densities, history = plate_with_hole(nelx=40, nely=40, on_iteration=on_iter)
+        print("\nRunning plate with hole optimisation (80x80, vf=0.40)...")
+        densities, history = plate_with_hole(nelx=80, nely=80, on_iteration=on_iter)
         print(f"Converged in {len(history)} iterations")
         print(f"Final compliance: {history[-1]:.4f}")
-        plot_density(densities, 40, 40, "Plate with Hole - 2D SIMP", "plate_density.png")
+        nelx_p, nely_p = 80, 80
+        plot_density(densities, nelx_p, nely_p, "Plate with Hole - 2D SIMP", "plate_density.png")
         plot_convergence(history, "Plate Compliance Convergence", "plate_convergence.png")
 
     if mode in ("all", "monocoque"):
