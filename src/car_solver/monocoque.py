@@ -226,6 +226,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     from car_solver.config import load_config
+    from car_solver.output import output_path
     from car_solver.visualise3d import save_density_vtk, plot_density_3d
 
     cfg = load_config()
@@ -248,17 +249,17 @@ if __name__ == "__main__":
     ax.set_ylabel("Compliance")
     ax.set_title("Monocoque Torsion Convergence")
     ax.grid(True, alpha=0.3)
-    fig.savefig("torsion_convergence.png", dpi=150, bbox_inches="tight")
+    fig.savefig(output_path("torsion_convergence.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("Saved torsion_convergence.png")
+    print(f"Saved {output_path('torsion_convergence.png')}")
 
     # 3D output
-    save_density_vtk(densities, tub.nelx, tub.nely, tub.nelz, "torsion_density.vtk")
+    save_density_vtk(densities, tub.nelx, tub.nely, tub.nelz, output_path("torsion_density.vtk"))
 
     try:
         plot_density_3d(
             densities, tub.nelx, tub.nely, tub.nelz,
-            "torsion_density.png", threshold=0.25,
+            output_path("torsion_density.png"), threshold=0.25,
         )
     except Exception as e:
         print(f"PNG render skipped: {e}")

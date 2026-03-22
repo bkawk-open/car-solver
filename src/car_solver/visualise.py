@@ -5,6 +5,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from car_solver.output import output_path
+
 
 def plot_density(
     densities: np.ndarray,
@@ -24,9 +26,10 @@ def plot_density(
     ax.set_xlabel("x elements")
     ax.set_ylabel("y elements")
     ax.set_aspect("equal")
-    fig.savefig(save_path or "density.png", dpi=150, bbox_inches="tight")
+    path = save_path or output_path("density.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved density plot to {save_path or 'density.png'}")
+    print(f"Saved {path}")
 
 
 def plot_convergence(
@@ -41,9 +44,10 @@ def plot_convergence(
     ax.set_ylabel("Compliance")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    fig.savefig(save_path or "convergence.png", dpi=150, bbox_inches="tight")
+    path = save_path or output_path("convergence.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved convergence plot to {save_path or 'convergence.png'}")
+    print(f"Saved {path}")
 
 
 def plot_monocoque(
@@ -61,7 +65,6 @@ def plot_monocoque(
     ax.set_ylabel("Scuttle top <-- elements --> Floor")
     ax.set_aspect("equal")
 
-    # Annotate regions
     ax.annotate("Cockpit\n(void)", xy=(nelx * 0.25, nely * 0.45),
                 fontsize=10, color="blue", ha="center", va="center",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
@@ -69,10 +72,10 @@ def plot_monocoque(
                 fontsize=8, color="red", ha="right", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
 
-    path = save_path or "monocoque_section.png"
+    path = save_path or output_path("monocoque_section.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved monocoque plot to {path}")
+    print(f"Saved {path}")
 
 
 if __name__ == "__main__":
@@ -100,17 +103,16 @@ if __name__ == "__main__":
         densities, history = mbb_beam(on_iteration=on_iter)
         print(f"Converged in {len(history)} iterations")
         print(f"Final compliance: {history[-1]:.4f}")
-        plot_density(densities, 180, 60, "MBB Beam - 2D SIMP", "mbb_density.png")
-        plot_convergence(history, "MBB Compliance Convergence", "mbb_convergence.png")
+        plot_density(densities, 180, 60, "MBB Beam - 2D SIMP", output_path("mbb_density.png"))
+        plot_convergence(history, "MBB Compliance Convergence", output_path("mbb_convergence.png"))
 
     if mode in ("all", "plate"):
         print("\nRunning plate with hole optimisation (80x80, vf=0.40)...")
         densities, history = plate_with_hole(nelx=80, nely=80, on_iteration=on_iter)
         print(f"Converged in {len(history)} iterations")
         print(f"Final compliance: {history[-1]:.4f}")
-        nelx_p, nely_p = 80, 80
-        plot_density(densities, nelx_p, nely_p, "Plate with Hole - 2D SIMP", "plate_density.png")
-        plot_convergence(history, "Plate Compliance Convergence", "plate_convergence.png")
+        plot_density(densities, 80, 80, "Plate with Hole - 2D SIMP", output_path("plate_density.png"))
+        plot_convergence(history, "Plate Compliance Convergence", output_path("plate_convergence.png"))
 
     if mode in ("all", "monocoque"):
         print("\nRunning monocoque cross-section optimisation...")
@@ -120,4 +122,4 @@ if __name__ == "__main__":
         print(f"Final compliance: {history[-1]:.4f}")
         print(f"Grid: {nelx}x{nely} elements")
         plot_monocoque(densities, nelx, nely)
-        plot_convergence(history, "Monocoque Compliance Convergence", "monocoque_convergence.png")
+        plot_convergence(history, "Monocoque Compliance Convergence", output_path("monocoque_convergence.png"))
