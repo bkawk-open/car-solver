@@ -72,3 +72,30 @@ def test_torsion_equal_and_opposite():
     cfg = _test_config()
     cases = calculate_load_cases(cfg)
     assert cases.torsion.front_left_n == -cases.torsion.front_right_n
+
+
+def test_sandwich_bending_stiffness():
+    """Sandwich panel should be much stiffer than a solid panel of the
+    same skin material weight (2x 2mm skins = 4mm solid equivalent)."""
+    cfg = _test_config()
+    mat = cfg.material
+    d_sandwich = mat.sandwich_bending_stiffness_n_mm
+
+    # Equivalent solid panel using only the skin material (4mm)
+    skin_total = 2 * mat.carbon_skin_thickness_mm
+    e_solid = mat.composite_modulus_gpa * 1000  # MPa
+    d_solid = e_solid * skin_total**3 / 12
+
+    # Sandwich should be dramatically stiffer at equal skin weight
+    assert d_sandwich > 5 * d_solid
+
+    # Sanity check: stiffness should be positive and finite
+    assert d_sandwich > 0
+    assert d_sandwich < 1e12
+
+
+def test_composite_modulus():
+    """Rule of mixtures composite modulus should match spec (~39 GPa)."""
+    cfg = _test_config()
+    E = cfg.material.composite_modulus_gpa
+    assert 35 < E < 45

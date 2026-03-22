@@ -95,6 +95,23 @@ class MaterialConfig:
             vf * self.fibre_modulus_gpa + (1 - vf) * self.resin_modulus_gpa
         )
 
+    @property
+    def sandwich_bending_stiffness_n_mm(self) -> float:
+        """Bending stiffness (EI per unit width) of a sandwich panel.
+
+        Two carbon skins of thickness t separated by a printed core of
+        thickness c. Uses parallel axis theorem: D = 2 * E_skin * t * (c/2 + t/2)^2
+        plus the core contribution E_core * c^3 / 12.
+
+        Returns stiffness in N.mm (E in MPa, dimensions in mm).
+        """
+        t = self.carbon_skin_thickness_mm
+        c = self.core_thickness_mm
+        e_skin = self.composite_modulus_gpa * 1000  # GPa to MPa
+        e_core = self.core_modulus_gpa * 1000
+        d_skin = (c + t) / 2  # skin centroid to neutral axis
+        return 2 * e_skin * t * d_skin**2 + e_core * c**3 / 12
+
 
 @dataclass(frozen=True)
 class SafetyConfig:
