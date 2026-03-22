@@ -4,7 +4,14 @@ from car_solver.config import (
     Config, MassConfig, GeometryConfig, WheelConfig, MaterialConfig,
     SafetyConfig, ObjectiveWeights, DynamicLoads, SIMPConfig, ManufacturingConfig,
 )
-from car_solver.loads import calculate_static_corners, calculate_load_cases, G
+from car_solver.loads import (
+    DistributedLoadSpec,
+    PointLoadSpec,
+    build_monocoque_load_definitions,
+    calculate_static_corners,
+    calculate_load_cases,
+    G,
+)
 
 
 def _test_config() -> Config:
@@ -99,3 +106,58 @@ def test_composite_modulus():
     cfg = _test_config()
     E = cfg.material.composite_modulus_gpa
     assert 35 < E < 45
+
+
+def test_monocoque_load_definitions_have_expected_support_sets():
+    cfg = _test_config()
+    defs = build_monocoque_load_definitions(cfg)
+    assert defs.torsion.support_set == "rear_face"
+    assert defs.bending.support_set == "pickup_points"
+    assert defs.corner.support_set == "pickup_points"
+    assert defs.combined.support_set == "rear_face"
+
+
+def test_monocoque_torsion_definition_uses_spec_magnitudes():
+    cfg = _test_config()
+    defs = build_monocoque_load_definitions(cfg)
+    subcase = defs.torsion.subcases[0]
+    assert len(subcase.loads) == 2
+    left, right = subcase.loads
+    assert isinstance(left, PointLoadSpec)
+    assert isinstance(right, PointLoadSpec)
+    assert left.target == "front_left_pickup"
+    assert left.axis == "z"
+    assert left.magnitude_n == 1000.0
+    assert right.target == "front_right_pickup"
+    assert right.axis == "z"
+    assert right.magnitude_n == -1000.0
+
+
+def test_monocoque_bending_definition_distributes_total_weight():
+    cfg = _test_config()
+    defs = build_monocoque_load_definitions(cfg)
+    cases = calculate_load_cases(cfg)
+    subcase = defs.bending.subcases[0]
+    assert len(subcase.loads) == 2
+    left, right = subcase.loads
+    assert isinstance(left, DistributedLoadSpec)
+    assert isinstance(right, DistributedLoadSpec)
+    assert left.target == "left_sill_top"
+    assert right.target == "right_sill_top"
+    assert abs(left.total_magnitude_n + right.total_magnitude_n + cases.bending.total_vertical_n) < 1e-9
+
+
+def test_monocoque_corner_weights_sum_to_one():
+    cfg = _test_config()
+    defs = build_monocoque_load_definitions(cfg)
+    total = sum(subcase.weight for subcase in defs.corner.subcases)
+    assert abs(total - 1.0) < 1e-9
+
+
+def test_monocoque_combined_weights_match_objective_weights():
+    cfg = _test_config()
+    defs = build_monocoque_load_definitions(cfg)
+    total = sum(subcase.weight for subcase in defs.combined.subcases)
+    assert abs(total - 1.0) < 1e-9
+    assert defs.combined.subcases[0].weight == cfg.weights.torsion
+    assert defs.combined.subcases[1].weight == cfg.weights.bending

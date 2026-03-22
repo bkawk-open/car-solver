@@ -7,11 +7,26 @@ Supports multiple load cases with weighted compliance objective,
 obstacle regions (forced void), and preserved regions (forced solid).
 """
 
+from dataclasses import dataclass
+from time import perf_counter
+
 import numpy as np
+from scipy import ndimage
 from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import splu
 
 from car_solver.config import Config, SIMPConfig
+from car_solver.linalg_backend import LinearAlgebraBackend, SciPySparseBackend
+
+
+@dataclass(frozen=True)
+class SolverTiming:
+    iterations: int
+    assembly_seconds: float
+    factorization_seconds: float
+    solve_seconds: float
+    sensitivity_filter_seconds: float
+    update_seconds: float
+    total_seconds: float
 
 
 def element_stiffness(nu: float) -> np.ndarray:
@@ -70,6 +85,58 @@ def density_filter(nelx: int, nely: int, rmin: float) -> tuple[np.ndarray, np.nd
     return iH, jH, sH
 
 
+def enforce_min_wall_thickness_2d(
+    densities: np.ndarray,
+    nelx: int,
+    nely: int,
+    min_wall_elements: int,
+    active: np.ndarray | None = None,
+    threshold: float = 0.5,
+) -> np.ndarray:
+    """Suppress solid features thinner than the requested element width.
+
+    This is a first-pass manufacturability constraint. It removes thin
+    solid regions by applying a binary opening to thresholded densities.
+    """
+    if min_wall_elements <= 1:
+        return np.zeros_like(densities, dtype=bool)
+
+    if active is None:
+        active = np.ones_like(densities, dtype=bool)
+
+    grid = densities.reshape(nelx, nely)
+    active_grid = active.reshape(nelx, nely)
+    solid = (grid >= threshold) & active_grid
+    structure = np.ones((min_wall_elements, min_wall_elements), dtype=bool)
+    opened = ndimage.binary_opening(solid, structure=structure)
+    removed = solid & ~opened
+    return removed.ravel()
+
+
+def enforce_min_lattice_cell_size_2d(
+    densities: np.ndarray,
+    nelx: int,
+    nely: int,
+    min_void_elements: int,
+    active: np.ndarray | None = None,
+    threshold: float = 0.5,
+) -> np.ndarray:
+    """Fill void features smaller than the requested element width."""
+    if min_void_elements <= 1:
+        return np.zeros_like(densities, dtype=bool)
+
+    if active is None:
+        active = np.ones_like(densities, dtype=bool)
+
+    grid = densities.reshape(nelx, nely)
+    active_grid = active.reshape(nelx, nely)
+    void = (grid < threshold) & active_grid
+    structure = np.ones((min_void_elements, min_void_elements), dtype=bool)
+    opened = ndimage.binary_opening(void, structure=structure)
+    filled = void & ~opened
+    return filled.ravel()
+
+
 class Solver2D:
     """2D SIMP topology optimisation on a rectangular domain."""
 
@@ -80,6 +147,9 @@ class Solver2D:
         simp: SIMPConfig,
         Emin: float = 1e-9,
         nu: float = 0.3,
+        min_wall_elements: int = 1,
+        min_void_elements: int = 1,
+        backend: LinearAlgebraBackend | None = None,
     ):
         self.nelx = nelx
         self.nely = nely
@@ -91,6 +161,9 @@ class Solver2D:
         self.Emin = Emin
         self.E0 = 1.0
         self.nu = nu
+        self.min_wall_elements = max(1, int(min_wall_elements))
+        self.min_void_elements = max(1, int(min_void_elements))
+        self.backend = backend or SciPySparseBackend()
 
         self.nel = nelx * nely
         self.ndof = 2 * (nelx + 1) * (nely + 1)
@@ -112,6 +185,7 @@ class Solver2D:
 
         # Precompute flattened KE for vectorised assembly
         self.KE_flat = self.KE.flatten()
+        self.last_timing: SolverTiming | None = None
 
     def _build_edof_mat(self) -> np.ndarray:
         ix, iy = np.meshgrid(np.arange(self.nelx), np.arange(self.nely), indexing="ij")
@@ -143,6 +217,7 @@ class Solver2D:
         obstacle: np.ndarray | None = None,
         x_init: np.ndarray | None = None,
         on_iteration: callable = None,
+        collect_timing: bool = False,
     ) -> tuple[np.ndarray, list[float]]:
         """Run SIMP optimisation.
 
@@ -201,8 +276,27 @@ class Solver2D:
         # Mask for elements that participate in sensitivity calculation
         active = designable & ~obstacle
 
+        removed = enforce_min_wall_thickness_2d(
+            xphys, self.nelx, self.nely, self.min_wall_elements, active=active,
+        )
+        x[removed] = 0.001
+        xphys[removed] = 0.001
+        filled = enforce_min_lattice_cell_size_2d(
+            xphys, self.nelx, self.nely, self.min_void_elements, active=active,
+        )
+        x[filled] = 1.0
+        xphys[filled] = 1.0
+
         compliance_history = []
         change = 1.0
+        timing = {
+            "assembly_seconds": 0.0,
+            "factorization_seconds": 0.0,
+            "solve_seconds": 0.0,
+            "sensitivity_filter_seconds": 0.0,
+            "update_seconds": 0.0,
+        }
+        total_start = perf_counter()
 
         for iteration in range(self.max_iter):
             if change < self.tol and iteration > 1:
@@ -212,17 +306,23 @@ class Solver2D:
             E_eff = self.Emin + xphys**self.penalty * (self.E0 - self.Emin)
 
             # Assemble global stiffness (vectorised)
+            phase_start = perf_counter()
             sK = (self.KE_flat[np.newaxis].T * E_eff).flatten(order="F")
-            K = coo_matrix((sK, (self.iK, self.jK)), shape=(self.ndof, self.ndof)).tocsc()
+            K = self.backend.assemble(sK, self.iK, self.jK, (self.ndof, self.ndof))
+            if collect_timing:
+                timing["assembly_seconds"] += perf_counter() - phase_start
 
             # Factor once, solve for all load cases
-            K_free = K[free_dofs, :][:, free_dofs]
-            lu = splu(K_free.tocsc())
+            phase_start = perf_counter()
+            lu = self.backend.factorize_free_matrix(K, free_dofs)
+            if collect_timing:
+                timing["factorization_seconds"] += perf_counter() - phase_start
 
             # Accumulate weighted compliance and sensitivity across load cases
             total_compliance = 0.0
             dc = np.zeros(nel)
 
+            phase_start = perf_counter()
             for f_vec, w in zip(force_list, weights):
                 u = np.zeros(self.ndof)
                 u[free_dofs] = lu.solve(f_vec[free_dofs])
@@ -239,6 +339,8 @@ class Solver2D:
                     * (self.E0 - self.Emin)
                     * ce[active]
                 )
+            if collect_timing:
+                timing["solve_seconds"] += perf_counter() - phase_start
 
             compliance_history.append(total_compliance)
 
@@ -246,10 +348,14 @@ class Solver2D:
             dv[active] = 1.0
 
             # Apply density filter to sensitivities
+            phase_start = perf_counter()
             dc = np.array(self.H @ (dc * xphys / self.Hs)).flatten()
             dv = np.array(self.H @ (dv * xphys / self.Hs)).flatten()
+            if collect_timing:
+                timing["sensitivity_filter_seconds"] += perf_counter() - phase_start
 
             # Optimality criteria update
+            phase_start = perf_counter()
             xold = x.copy()
             x = self._oc_update(x, dc, dv, designable)
             x[obstacle] = 0.001
@@ -257,11 +363,37 @@ class Solver2D:
             # Filter densities
             xphys = np.array(self.H @ x / self.Hs).flatten()
             xphys[obstacle] = 0.001
+
+            removed = enforce_min_wall_thickness_2d(
+                xphys, self.nelx, self.nely, self.min_wall_elements, active=active,
+            )
+            x[removed] = 0.001
+            xphys[removed] = 0.001
+            filled = enforce_min_lattice_cell_size_2d(
+                xphys, self.nelx, self.nely, self.min_void_elements, active=active,
+            )
+            x[filled] = 1.0
+            xphys[filled] = 1.0
             change = np.max(np.abs(x - xold))
+            if collect_timing:
+                timing["update_seconds"] += perf_counter() - phase_start
 
             if on_iteration:
                 on_iteration(iteration, xphys.copy(), total_compliance, change)
 
+        self.last_timing = (
+            SolverTiming(
+                iterations=len(compliance_history),
+                assembly_seconds=timing["assembly_seconds"],
+                factorization_seconds=timing["factorization_seconds"],
+                solve_seconds=timing["solve_seconds"],
+                sensitivity_filter_seconds=timing["sensitivity_filter_seconds"],
+                update_seconds=timing["update_seconds"],
+                total_seconds=perf_counter() - total_start,
+            )
+            if collect_timing
+            else None
+        )
         return xphys, compliance_history
 
     def _oc_update(

@@ -1,10 +1,13 @@
 """Tests for the 2D SIMP solver."""
 
 import numpy as np
+import pytest
 
 from car_solver.config import SIMPConfig
 from car_solver.solver2d import (
     Solver2D, cantilever_beam, mbb_beam, plate_with_hole, element_stiffness,
+    enforce_min_wall_thickness_2d,
+    enforce_min_lattice_cell_size_2d,
 )
 
 
@@ -18,6 +21,21 @@ def _quick_simp(**overrides) -> SIMPConfig:
     )
     defaults.update(overrides)
     return SIMPConfig(**defaults)
+
+
+@pytest.fixture(scope="module")
+def cantilever_result():
+    return cantilever_beam(nelx=30, nely=10, simp=_quick_simp())
+
+
+@pytest.fixture(scope="module")
+def mbb_result():
+    return mbb_beam(nelx=60, nely=20, simp=_quick_simp())
+
+
+@pytest.fixture(scope="module")
+def plate_with_hole_result():
+    return plate_with_hole(nelx=40, nely=40, simp=_quick_simp())
 
 
 def test_element_stiffness_symmetry():
@@ -34,25 +52,25 @@ def test_element_stiffness_positive_definite():
 
 # --- Cantilever beam ---
 
-def test_cantilever_converges():
+def test_cantilever_converges(cantilever_result):
     """Cantilever beam should converge and reduce compliance."""
-    densities, history = cantilever_beam(nelx=30, nely=10, simp=_quick_simp())
+    densities, history = cantilever_result
     assert len(history) > 1
     assert history[-1] < history[0]
     assert abs(np.mean(densities) - 0.4) < 0.05
 
 
-def test_cantilever_structure_is_sensible():
+def test_cantilever_structure_is_sensible(cantilever_result):
     """More material near the fixed end than the free end."""
-    densities, _ = cantilever_beam(nelx=30, nely=10, simp=_quick_simp())
+    densities, _ = cantilever_result
     grid = densities.reshape(30, 10)
     assert grid[:10, :].mean() > grid[20:, :].mean()
 
 
 # --- MBB beam ---
 
-def test_mbb_converges():
-    densities, history = mbb_beam(nelx=60, nely=20, simp=_quick_simp())
+def test_mbb_converges(mbb_result):
+    densities, history = mbb_result
     assert len(history) > 1
     assert history[-1] < history[0]
     # MBB half-beam converges volume fraction slowly; verify it's
@@ -61,24 +79,24 @@ def test_mbb_converges():
     assert np.mean(densities) < 0.5
 
 
-def test_mbb_structure_is_sensible():
+def test_mbb_structure_is_sensible(mbb_result):
     """Left quarter (near pinned support + load) denser than right-centre void."""
-    densities, _ = mbb_beam(nelx=60, nely=20, simp=_quick_simp())
+    densities, _ = mbb_result
     grid = densities.reshape(60, 20)
     assert grid[:15, :].mean() > grid[35:50, 5:15].mean()
 
 
 # --- Plate with hole ---
 
-def test_plate_with_hole_converges():
-    densities, history = plate_with_hole(nelx=40, nely=40, simp=_quick_simp())
+def test_plate_with_hole_converges(plate_with_hole_result):
+    densities, history = plate_with_hole_result
     assert len(history) > 1
     assert history[-1] < history[0]
 
 
-def test_plate_with_hole_obstacle_stays_void():
+def test_plate_with_hole_obstacle_stays_void(plate_with_hole_result):
     """Elements inside the hole should remain at minimum density."""
-    densities, _ = plate_with_hole(nelx=40, nely=40, simp=_quick_simp())
+    densities, _ = plate_with_hole_result
     grid = densities.reshape(40, 40)
     # Hole is at origin (i=0, j=0), radius ~10 elements
     hole_region = grid[:5, :5]
@@ -189,3 +207,93 @@ def test_obstacle_elements_stay_void():
         fixed_dofs, force, designable=designable, obstacle=obstacle,
     )
     assert np.all(densities[95:105] < 0.01)
+
+
+def test_min_wall_thickness_2d_removes_single_element_column():
+    densities = np.zeros(25)
+    densities[[2, 7, 12, 17, 22]] = 1.0  # one-element-wide vertical member in 5x5
+    removed = enforce_min_wall_thickness_2d(
+        densities, nelx=5, nely=5, min_wall_elements=2,
+    )
+    assert np.all(removed[[2, 7, 12, 17, 22]])
+
+
+def test_min_wall_thickness_2d_preserves_two_element_block():
+    densities = np.zeros(25)
+    keep = [6, 7, 11, 12]
+    densities[keep] = 1.0
+    removed = enforce_min_wall_thickness_2d(
+        densities, nelx=5, nely=5, min_wall_elements=2,
+    )
+    assert not np.any(removed[keep])
+
+
+def test_min_lattice_cell_size_2d_fills_single_element_void():
+    densities = np.ones(25)
+    densities[12] = 0.0
+    filled = enforce_min_lattice_cell_size_2d(
+        densities, nelx=5, nely=5, min_void_elements=2,
+    )
+    assert filled[12]
+
+
+def test_min_lattice_cell_size_2d_preserves_two_by_two_void():
+    densities = np.ones(25)
+    keep_void = [6, 7, 11, 12]
+    densities[keep_void] = 0.0
+    filled = enforce_min_lattice_cell_size_2d(
+        densities, nelx=5, nely=5, min_void_elements=2,
+    )
+    assert not np.any(filled[keep_void])
+
+
+def test_min_wall_thickness_2d_before_after_regression():
+    densities = np.zeros(25)
+    thin_wall = [0, 5, 10, 15, 20]
+    densities[thin_wall] = 1.0
+    before_solid = densities.reshape(5, 5) >= 0.5
+    assert before_solid[:, 0].all()
+
+    removed = enforce_min_wall_thickness_2d(
+        densities, nelx=5, nely=5, min_wall_elements=2,
+    )
+    constrained = densities.copy()
+    constrained[removed] = 0.0
+    after_solid = constrained.reshape(5, 5) >= 0.5
+
+    assert not after_solid[:, 0].any()
+
+
+def test_min_lattice_cell_size_2d_before_after_regression():
+    densities = np.zeros(25)
+    for x in range(1, 4):
+        for y in range(1, 4):
+            densities[x * 5 + y] = 1.0
+    tiny_void = [12]
+    densities[tiny_void] = 0.0
+    before_solid = densities.reshape(5, 5) >= 0.5
+    assert not before_solid[2, 2]
+
+    filled = enforce_min_lattice_cell_size_2d(
+        densities, nelx=5, nely=5, min_void_elements=2,
+    )
+    constrained = densities.copy()
+    constrained[filled] = 1.0
+    after_solid = constrained.reshape(5, 5) >= 0.5
+    assert after_solid[2, 2]
+
+
+def test_manufacturing_constraints_2d_respect_active_mask():
+    densities = np.ones(25)
+    densities[12] = 0.0
+    active = np.ones(25, dtype=bool)
+    active[12] = False
+
+    filled = enforce_min_lattice_cell_size_2d(
+        densities,
+        nelx=5,
+        nely=5,
+        min_void_elements=2,
+        active=active,
+    )
+    assert not filled[12]

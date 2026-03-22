@@ -2,10 +2,12 @@
 
 Derives force magnitudes at each suspension pickup point from vehicle
 geometry, mass distribution, and dynamic load factors defined in .env.
-All forces in Newtons, distances in millimetres unless noted.
+Also defines structured monocoque load cases that can be converted into
+solver-ready force vectors by geometry-specific code.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 from car_solver.config import Config
 
@@ -67,6 +69,60 @@ class LoadCases:
     rear_right_dynamic: CornerLoads
     torsion: TorsionLoad
     bending: BendingLoad
+
+
+Axis = Literal["x", "y", "z"]
+SupportSet = Literal["rear_face", "pickup_points"]
+
+
+@dataclass(frozen=True)
+class PointLoadSpec:
+    """Point load applied to a named target node."""
+
+    target: str
+    axis: Axis
+    magnitude_n: float
+
+
+@dataclass(frozen=True)
+class DistributedLoadSpec:
+    """Total load distributed evenly over a named target node group."""
+
+    target: str
+    axis: Axis
+    total_magnitude_n: float
+
+
+LoadSpec = PointLoadSpec | DistributedLoadSpec
+
+
+@dataclass(frozen=True)
+class WeightedSubcase:
+    """A solver subcase with one or more loads and an objective weight."""
+
+    name: str
+    loads: tuple[LoadSpec, ...]
+    weight: float = 1.0
+
+
+@dataclass(frozen=True)
+class SolverLoadCaseDefinition:
+    """Structured load-case definition decoupled from geometry-specific node ids."""
+
+    name: str
+    support_set: SupportSet
+    subcases: tuple[WeightedSubcase, ...]
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class MonocoqueLoadDefinitions:
+    """Structured monocoque load definitions for the current config."""
+
+    torsion: SolverLoadCaseDefinition
+    bending: SolverLoadCaseDefinition
+    corner: SolverLoadCaseDefinition
+    combined: SolverLoadCaseDefinition
 
 
 def calculate_static_corners(cfg: Config) -> CornerWeights:
@@ -153,6 +209,212 @@ def calculate_load_cases(cfg: Config) -> LoadCases:
         rear_right_dynamic=rr,
         torsion=torsion,
         bending=bending,
+    )
+
+
+def build_monocoque_load_definitions(cfg: Config) -> MonocoqueLoadDefinitions:
+    """Build structured monocoque load definitions from config.
+
+    These definitions are geometry-agnostic. Named targets such as
+    ``front_left_pickup`` or ``left_sill_top`` are resolved into actual
+    node ids by the monocoque geometry layer.
+    """
+    derived = calculate_load_cases(cfg)
+
+    fl = derived.front_left_dynamic
+    rl = derived.rear_left_dynamic
+
+    front_total = fl.vertical_n + fl.lateral_n + fl.longitudinal_n
+    rear_total = rl.vertical_n + rl.lateral_n + rl.longitudinal_n
+
+    front_frac = 2.0 / 3.0  # spec split: 0.20 front vs 0.10 rear
+    rear_frac = 1.0 / 3.0
+
+    torsion = SolverLoadCaseDefinition(
+        name="torsion",
+        support_set="rear_face",
+        description="Equal and opposite front-corner vertical loads with rear fixed.",
+        subcases=(
+            WeightedSubcase(
+                name="torsion",
+                loads=(
+                    PointLoadSpec("front_left_pickup", "z", derived.torsion.front_left_n),
+                    PointLoadSpec("front_right_pickup", "z", derived.torsion.front_right_n),
+                ),
+            ),
+        ),
+    )
+
+    bending = SolverLoadCaseDefinition(
+        name="bending",
+        support_set="pickup_points",
+        description="Vehicle weight distributed across both sill top edges.",
+        subcases=(
+            WeightedSubcase(
+                name="bending",
+                loads=(
+                    DistributedLoadSpec(
+                        "left_sill_top", "z", -derived.bending.total_vertical_n / 2
+                    ),
+                    DistributedLoadSpec(
+                        "right_sill_top", "z", -derived.bending.total_vertical_n / 2
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    corner = SolverLoadCaseDefinition(
+        name="corner",
+        support_set="pickup_points",
+        description="Front and rear corner loads split into directional subcases.",
+        subcases=(
+            WeightedSubcase(
+                name="front_right_vertical",
+                loads=(PointLoadSpec("front_right_load", "z", -fl.vertical_n),),
+                weight=front_frac * fl.vertical_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_right_lateral",
+                loads=(PointLoadSpec("front_right_load", "y", fl.lateral_n),),
+                weight=front_frac * fl.lateral_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_right_braking",
+                loads=(PointLoadSpec("front_right_load", "x", fl.longitudinal_n),),
+                weight=front_frac * fl.longitudinal_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_vertical",
+                loads=(PointLoadSpec("front_left_load", "z", -fl.vertical_n),),
+                weight=front_frac * fl.vertical_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_lateral",
+                loads=(PointLoadSpec("front_left_load", "y", -fl.lateral_n),),
+                weight=front_frac * fl.lateral_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_braking",
+                loads=(PointLoadSpec("front_left_load", "x", fl.longitudinal_n),),
+                weight=front_frac * fl.longitudinal_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_vertical",
+                loads=(PointLoadSpec("rear_right_load", "z", -rl.vertical_n),),
+                weight=rear_frac * rl.vertical_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_lateral",
+                loads=(PointLoadSpec("rear_right_load", "y", rl.lateral_n),),
+                weight=rear_frac * rl.lateral_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_braking",
+                loads=(PointLoadSpec("rear_right_load", "x", -rl.longitudinal_n),),
+                weight=rear_frac * rl.longitudinal_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_vertical",
+                loads=(PointLoadSpec("rear_left_load", "z", -rl.vertical_n),),
+                weight=rear_frac * rl.vertical_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_lateral",
+                loads=(PointLoadSpec("rear_left_load", "y", -rl.lateral_n),),
+                weight=rear_frac * rl.lateral_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_braking",
+                loads=(PointLoadSpec("rear_left_load", "x", -rl.longitudinal_n),),
+                weight=rear_frac * rl.longitudinal_n / rear_total / 2,
+            ),
+        ),
+    )
+
+    combined = SolverLoadCaseDefinition(
+        name="combined",
+        support_set="rear_face",
+        description="Exploratory combined weighted study using a shared rear-face support set.",
+        subcases=(
+            WeightedSubcase(
+                name="torsion",
+                loads=torsion.subcases[0].loads,
+                weight=cfg.weights.torsion,
+            ),
+            WeightedSubcase(
+                name="bending",
+                loads=bending.subcases[0].loads,
+                weight=cfg.weights.bending,
+            ),
+            WeightedSubcase(
+                name="front_right_vertical",
+                loads=(PointLoadSpec("front_right_load", "z", -fl.vertical_n),),
+                weight=cfg.weights.front_corner * fl.vertical_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_right_lateral",
+                loads=(PointLoadSpec("front_right_load", "y", fl.lateral_n),),
+                weight=cfg.weights.front_corner * fl.lateral_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_right_braking",
+                loads=(PointLoadSpec("front_right_load", "x", fl.longitudinal_n),),
+                weight=cfg.weights.front_corner * fl.longitudinal_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_vertical",
+                loads=(PointLoadSpec("front_left_load", "z", -fl.vertical_n),),
+                weight=cfg.weights.front_corner * fl.vertical_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_lateral",
+                loads=(PointLoadSpec("front_left_load", "y", -fl.lateral_n),),
+                weight=cfg.weights.front_corner * fl.lateral_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="front_left_braking",
+                loads=(PointLoadSpec("front_left_load", "x", fl.longitudinal_n),),
+                weight=cfg.weights.front_corner * fl.longitudinal_n / front_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_vertical",
+                loads=(PointLoadSpec("rear_right_load", "z", -rl.vertical_n),),
+                weight=cfg.weights.rear_corner * rl.vertical_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_lateral",
+                loads=(PointLoadSpec("rear_right_load", "y", rl.lateral_n),),
+                weight=cfg.weights.rear_corner * rl.lateral_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_right_braking",
+                loads=(PointLoadSpec("rear_right_load", "x", -rl.longitudinal_n),),
+                weight=cfg.weights.rear_corner * rl.longitudinal_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_vertical",
+                loads=(PointLoadSpec("rear_left_load", "z", -rl.vertical_n),),
+                weight=cfg.weights.rear_corner * rl.vertical_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_lateral",
+                loads=(PointLoadSpec("rear_left_load", "y", -rl.lateral_n),),
+                weight=cfg.weights.rear_corner * rl.lateral_n / rear_total / 2,
+            ),
+            WeightedSubcase(
+                name="rear_left_braking",
+                loads=(PointLoadSpec("rear_left_load", "x", -rl.longitudinal_n),),
+                weight=cfg.weights.rear_corner * rl.longitudinal_n / rear_total / 2,
+            ),
+        ),
+    )
+
+    return MonocoqueLoadDefinitions(
+        torsion=torsion,
+        bending=bending,
+        corner=corner,
+        combined=combined,
     )
 
 

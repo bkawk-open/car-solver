@@ -13,3 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+parallel = ["pytest-xdist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

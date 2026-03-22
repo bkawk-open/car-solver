@@ -1,5 +1,7 @@
 """3D visualisation for topology optimisation results using PyVista."""
 
+from pathlib import Path
+
 import numpy as np
 
 from car_solver.output import output_path
@@ -58,6 +60,49 @@ def plot_density_3d(
     plotter.screenshot(path)
     plotter.close()
     print(f"Saved {path}")
+
+
+def make_iteration_snapshot_callback(
+    nelx: int,
+    nely: int,
+    nelz: int,
+    filename_prefix: str,
+    every: int = 10,
+    threshold: float = 0.3,
+    output_dir: str | None = None,
+    base_callback: callable | None = None,
+) -> tuple[callable, list[str]]:
+    """Create an iteration callback that saves density snapshots every N steps."""
+    if every <= 0:
+        raise ValueError("Snapshot interval 'every' must be >= 1")
+
+    snapshot_paths: list[str] = []
+
+    def callback(iteration, densities, compliance, change):
+        if base_callback is not None:
+            base_callback(iteration, densities, compliance, change)
+
+        if iteration % every != 0:
+            return
+
+        if output_dir is None:
+            path = output_path(f"{filename_prefix}_{iteration:04d}.png")
+        else:
+            target = Path(output_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            path = str(target / f"{filename_prefix}_{iteration:04d}.png")
+
+        plot_density_3d(
+            densities,
+            nelx,
+            nely,
+            nelz,
+            save_path=path,
+            threshold=threshold,
+        )
+        snapshot_paths.append(path)
+
+    return callback, snapshot_paths
 
 
 if __name__ == "__main__":
