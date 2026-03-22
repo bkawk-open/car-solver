@@ -131,20 +131,33 @@ class MonocoqueTub:
         """Get DOF index for a node. axis: 0=x, 1=y, 2=z."""
         return 3 * self.node(ix, iy, iz) + axis
 
-    def pickup_nodes(self) -> dict[str, int]:
-        """Return node indices for suspension pickup points.
+    # Tuned SIMP parameters for 3D monocoque: p=4 and r=1.2 give
+    # 17% grey elements vs 57% with the 2D defaults (p=3 r=1.5)
+    MONOCOQUE_SIMP = dict(penalty=4.0, convergence_tolerance=0.005, filter_radius=1.2)
 
-        Front pickups: at x=0, outer sill (y=nely), floor level (z=0).
-        Rear pickups: at x=nelx, outer sill (y=nely), floor level (z=0).
+    def pickup_nodes(self) -> dict[str, int]:
+        """Return node indices for all four suspension pickup points.
+
+        Right-side pickups are at the outer sill (y=nely).
+        Left-side pickups are on the centreline (y=0) - the symmetry
+        plane mirrors these to the physical left-side position.
+        All pickups at floor level (z=0).
         """
         return {
             "front_right": self.node(0, self.nely, 0),
             "rear_right": self.node(self.nelx, self.nely, 0),
+            "front_left": self.node(0, 0, 0),
+            "rear_left": self.node(self.nelx, 0, 0),
         }
 
     def build_solver(self) -> Solver3D:
-        """Create a Solver3D instance for this tub geometry."""
-        return Solver3D(self.nelx, self.nely, self.nelz, self.cfg.simp)
+        """Create a Solver3D with tuned monocoque SIMP parameters."""
+        simp = SIMPConfig(
+            volume_fraction=self.cfg.simp.volume_fraction,
+            max_iterations=self.cfg.simp.max_iterations,
+            **self.MONOCOQUE_SIMP,
+        )
+        return Solver3D(self.nelx, self.nely, self.nelz, simp)
 
     def symmetry_dofs(self) -> np.ndarray:
         """DOFs fixed for half-width symmetry: y-displacement = 0 on y=0 face."""
@@ -172,17 +185,7 @@ def torsion_load_case(
     Returns (densities, compliance_history, tub).
     """
     tub = MonocoqueTub(cfg, element_size_mm)
-
-    # Tuned SIMP parameters for 3D monocoque: p=4 and r=1.2 give
-    # 17% grey elements vs 57% with the 2D defaults (p=3 r=1.5)
-    simp = SIMPConfig(
-        penalty=4.0,
-        volume_fraction=cfg.simp.volume_fraction,
-        convergence_tolerance=0.005,
-        max_iterations=cfg.simp.max_iterations,
-        filter_radius=1.2,
-    )
-    solver = Solver3D(tub.nelx, tub.nely, tub.nelz, simp)
+    solver = tub.build_solver()
     pickups = tub.pickup_nodes()
 
     # --- Boundary conditions ---
