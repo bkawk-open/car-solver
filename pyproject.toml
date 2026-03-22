@@ -3,7 +3,13 @@ name = "car-solver"
 version = "0.1.0"
 description = ""
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyvista",
+    "matplotlib",
+    "python-dotenv",
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
