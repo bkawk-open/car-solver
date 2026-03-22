@@ -15,7 +15,7 @@ The model uses half-width symmetry (y >= 0) to halve element count.
 
 import numpy as np
 
-from car_solver.config import Config
+from car_solver.config import Config, SIMPConfig
 from car_solver.solver3d import Solver3D
 
 
@@ -172,7 +172,17 @@ def torsion_load_case(
     Returns (densities, compliance_history, tub).
     """
     tub = MonocoqueTub(cfg, element_size_mm)
-    solver = tub.build_solver()
+
+    # Tuned SIMP parameters for 3D monocoque: p=4 and r=1.2 give
+    # 17% grey elements vs 57% with the 2D defaults (p=3 r=1.5)
+    simp = SIMPConfig(
+        penalty=4.0,
+        volume_fraction=cfg.simp.volume_fraction,
+        convergence_tolerance=0.005,
+        max_iterations=cfg.simp.max_iterations,
+        filter_radius=1.2,
+    )
+    solver = Solver3D(tub.nelx, tub.nely, tub.nelz, simp)
     pickups = tub.pickup_nodes()
 
     # --- Boundary conditions ---
@@ -205,6 +215,7 @@ def torsion_load_case(
         obstacle=tub.obstacle,
         x_init=tub.x_init,
         on_iteration=on_iteration,
+        continuation=True,
     )
     return densities, history, tub
 

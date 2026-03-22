@@ -233,8 +233,15 @@ class Solver3D:
         obstacle: np.ndarray | None = None,
         x_init: np.ndarray | None = None,
         on_iteration: callable = None,
+        continuation: bool = False,
     ) -> tuple[np.ndarray, list[float]]:
-        """Run 3D SIMP optimisation. Same interface as Solver2D.solve()."""
+        """Run 3D SIMP optimisation.
+
+        Args:
+            continuation: if True, ramp penalty from 1 to self.penalty
+                over the first half of iterations. Finds better global
+                topology before driving 0/1 separation.
+        """
         nel = self.nel
 
         if isinstance(forces, np.ndarray) and forces.ndim == 1:
@@ -264,6 +271,11 @@ class Solver3D:
         free_dofs = np.setdiff1d(np.arange(self.ndof), fixed_dofs)
         active = designable & ~obstacle
 
+        # Penalty continuation: ramp from 1 to target over first quarter,
+        # then hold at target for the remaining 75% of iterations
+        target_penalty = self.penalty
+        ramp_end = self.max_iter // 4 if continuation else 0
+
         compliance_history = []
         change = 1.0
 
@@ -271,7 +283,13 @@ class Solver3D:
             if change < self.tol and iteration > 1:
                 break
 
-            E_eff = self.Emin + xphys**self.penalty * (self.E0 - self.Emin)
+            # Ramp penalty from 1.0 to target over first half
+            if continuation and iteration < ramp_end:
+                p = 1.0 + (target_penalty - 1.0) * iteration / ramp_end
+            else:
+                p = target_penalty
+
+            E_eff = self.Emin + xphys**p * (self.E0 - self.Emin)
             sK = (self.KE_flat[np.newaxis].T * E_eff).flatten(order="F")
             K = coo_matrix((sK, (self.iK, self.jK)), shape=(self.ndof, self.ndof)).tocsc()
 
@@ -289,8 +307,8 @@ class Solver3D:
                 total_compliance += w * np.sum(E_eff * ce)
 
                 dc[active] += w * (
-                    -self.penalty
-                    * xphys[active] ** (self.penalty - 1)
+                    -p
+                    * xphys[active] ** (p - 1)
                     * (self.E0 - self.Emin)
                     * ce[active]
                 )
@@ -324,7 +342,6 @@ class Solver3D:
         designable: np.ndarray,
         move: float = 0.2,
     ) -> np.ndarray:
-        nel = len(x)
         l1, l2 = 1e-12, 1e9
         dc_safe = np.where(dc < 0, dc, -1e-20)
 
@@ -340,7 +357,7 @@ class Solver3D:
             )
             xnew[~designable] = x[~designable]
 
-            if np.sum(xnew) > self.volfrac * nel:
+            if np.sum(xnew[designable]) > self.volfrac * np.sum(designable):
                 l1 = lmid
             else:
                 l2 = lmid

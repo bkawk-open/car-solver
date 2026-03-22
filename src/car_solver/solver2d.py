@@ -273,7 +273,6 @@ class Solver2D:
         move: float = 0.2,
     ) -> np.ndarray:
         """Optimality criteria update with bisection on volume constraint."""
-        nel = len(x)
         l1, l2 = 1e-12, 1e9
 
         # For non-active elements dc=0 and dv=0, so ratio is irrelevant.
@@ -292,7 +291,7 @@ class Solver2D:
             )
             xnew[~designable] = x[~designable]
 
-            if np.sum(xnew) > self.volfrac * nel:
+            if np.sum(xnew[designable]) > self.volfrac * np.sum(designable):
                 l1 = lmid
             else:
                 l2 = lmid
