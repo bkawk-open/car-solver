@@ -168,6 +168,47 @@ class MonocoqueTub:
         return np.array(dofs, dtype=int)
 
 
+def _pickup_dofs(tub: MonocoqueTub, names: list[str]) -> np.ndarray:
+    """Fix all 3 DOFs (x, y, z) at the named pickup nodes."""
+    pickups = tub.pickup_nodes()
+    dofs = []
+    for name in names:
+        n = pickups[name]
+        dofs.extend([3*n, 3*n+1, 3*n+2])
+    return np.array(dofs, dtype=int)
+
+
+def _rear_face_dofs(tub: MonocoqueTub) -> np.ndarray:
+    """Fix all DOFs on the rear face (x=nelx)."""
+    dofs = []
+    for iy in range(tub.nely + 1):
+        for iz in range(tub.nelz + 1):
+            n = tub.node(tub.nelx, iy, iz)
+            dofs.extend([3*n, 3*n+1, 3*n+2])
+    return np.array(dofs, dtype=int)
+
+
+def _solve_load_case(
+    tub: MonocoqueTub,
+    fixed_dofs: np.ndarray,
+    forces: np.ndarray | list[np.ndarray],
+    weights: list[float] | None = None,
+    on_iteration: callable = None,
+) -> tuple[np.ndarray, list[float]]:
+    """Common solve wrapper for all monocoque load cases."""
+    solver = tub.build_solver()
+    return solver.solve(
+        fixed_dofs,
+        forces,
+        weights=weights,
+        designable=tub.designable,
+        obstacle=tub.obstacle,
+        x_init=tub.x_init,
+        on_iteration=on_iteration,
+        continuation=True,
+    )
+
+
 def torsion_load_case(
     cfg: Config,
     element_size_mm: float = 50.0,
@@ -185,84 +226,109 @@ def torsion_load_case(
     Returns (densities, compliance_history, tub).
     """
     tub = MonocoqueTub(cfg, element_size_mm)
-    solver = tub.build_solver()
     pickups = tub.pickup_nodes()
 
-    # --- Boundary conditions ---
-    # Symmetry: fix y-displacement on centreline (y=0)
-    sym_dofs = tub.symmetry_dofs()
+    # BCs: symmetry + rear face fully fixed
+    fixed_dofs = np.union1d(tub.symmetry_dofs(), _rear_face_dofs(tub))
 
-    # Rear fixed: all DOFs on rear face (x=nelx)
-    rear_dofs = []
-    for iy in range(tub.nely + 1):
-        for iz in range(tub.nelz + 1):
-            n = tub.node(tub.nelx, iy, iz)
-            rear_dofs.extend([3*n, 3*n+1, 3*n+2])
-    rear_dofs = np.array(rear_dofs, dtype=int)
-
-    fixed_dofs = np.union1d(sym_dofs, rear_dofs)
-
-    # --- Torsion load ---
-    # 1000N downward at front-right pickup
+    # 1000N downward at front-right pickup (symmetry gives equal-opposite)
+    solver = tub.build_solver()
     force = np.zeros(solver.ndof)
-    fr_node = pickups["front_right"]
-    force[3 * fr_node + 2] = -1000.0  # z-direction, downward
+    force[3 * pickups["front_right"] + 2] = -1.0
 
-    # Normalise (topology is scale-invariant)
-    force = force / np.max(np.abs(force))
-
-    densities, history = solver.solve(
-        fixed_dofs,
-        force,
-        designable=tub.designable,
-        obstacle=tub.obstacle,
-        x_init=tub.x_init,
-        on_iteration=on_iteration,
-        continuation=True,
-    )
+    densities, history = _solve_load_case(tub, fixed_dofs, force, on_iteration=on_iteration)
     return densities, history, tub
 
 
-if __name__ == "__main__":
+def bending_load_case(
+    cfg: Config,
+    element_size_mm: float = 50.0,
+    on_iteration: callable = None,
+) -> tuple[np.ndarray, list[float], MonocoqueTub]:
+    """Bending load case: distributed vertical load, fixed at all four pickups.
+
+    Per spec: distributed load along sill representing vehicle weight at 1g,
+    fixed at all four pickup points. The load is applied as uniform downward
+    force on nodes along the top of the outer sill (y=nely, z=nelz).
+
+    In the half-width symmetry model, we fix all four pickup corners
+    (right-side at the sill, left-side on the centreline) and distribute
+    the total vehicle weight as downward force along the sill top edge.
+
+    Returns (densities, compliance_history, tub).
+    """
+    tub = MonocoqueTub(cfg, element_size_mm)
+    solver = tub.build_solver()
+
+    # BCs: symmetry + all four pickup corners fixed
+    pickup_dofs = _pickup_dofs(tub, ["front_right", "rear_right", "front_left", "rear_left"])
+    fixed_dofs = np.union1d(tub.symmetry_dofs(), pickup_dofs)
+
+    # Distributed downward load along sill top edge (y=nely, z=nelz)
+    # These nodes run the full length of the tub at the outer sill top
+    force = np.zeros(solver.ndof)
+    sill_top_nodes = []
+    for ix in range(tub.nelx + 1):
+        sill_top_nodes.append(tub.node(ix, tub.nely, tub.nelz))
+
+    load_per_node = -1.0 / len(sill_top_nodes)
+    for n in sill_top_nodes:
+        force[3 * n + 2] += load_per_node  # z-direction, downward
+
+    densities, history = _solve_load_case(tub, fixed_dofs, force, on_iteration=on_iteration)
+    return densities, history, tub
+
+
+def _run_and_save(name, densities, history, tub):
+    """Save convergence plot, VTK, and PNG for a load case."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    from car_solver.config import load_config
     from car_solver.output import output_path
     from car_solver.visualise3d import save_density_vtk, plot_density_3d
-
-    cfg = load_config()
-
-    def on_iter(it, densities, compliance, change):
-        if it % 5 == 0:
-            print(f"  Iteration {it:3d}: compliance={compliance:.4f}, change={change:.4f}")
-
-    print("Running monocoque torsion optimisation...")
-    densities, history, tub = torsion_load_case(cfg, on_iteration=on_iter)
 
     print(f"Grid: {tub.nelx}x{tub.nely}x{tub.nelz} ({tub.nel:,} elements)")
     print(f"Converged in {len(history)} iterations")
     print(f"Final compliance: {history[-1]:.4f}")
 
-    # Convergence plot
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(history, "b-", linewidth=1.5)
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Compliance")
-    ax.set_title("Monocoque Torsion Convergence")
+    ax.set_title(f"Monocoque {name.title()} Convergence")
     ax.grid(True, alpha=0.3)
-    fig.savefig(output_path("torsion_convergence.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(output_path(f"{name}_convergence.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved {output_path('torsion_convergence.png')}")
+    print(f"Saved {output_path(f'{name}_convergence.png')}")
 
-    # 3D output
-    save_density_vtk(densities, tub.nelx, tub.nely, tub.nelz, output_path("torsion_density.vtk"))
+    save_density_vtk(densities, tub.nelx, tub.nely, tub.nelz, output_path(f"{name}_density.vtk"))
 
     try:
         plot_density_3d(
             densities, tub.nelx, tub.nely, tub.nelz,
-            output_path("torsion_density.png"), threshold=0.25,
+            output_path(f"{name}_density.png"), threshold=0.25,
         )
     except Exception as e:
         print(f"PNG render skipped: {e}")
+
+
+if __name__ == "__main__":
+    import sys
+    from car_solver.config import load_config
+
+    cfg = load_config()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    def on_iter(it, densities, compliance, change):
+        if it % 10 == 0:
+            print(f"  Iteration {it:3d}: compliance={compliance:.4f}, change={change:.4f}")
+
+    if mode in ("all", "torsion"):
+        print("Running monocoque torsion...")
+        d, h, tub = torsion_load_case(cfg, on_iteration=on_iter)
+        _run_and_save("torsion", d, h, tub)
+
+    if mode in ("all", "bending"):
+        print("\nRunning monocoque bending...")
+        d, h, tub = bending_load_case(cfg, on_iteration=on_iter)
+        _run_and_save("bending", d, h, tub)

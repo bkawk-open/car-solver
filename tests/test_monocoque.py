@@ -6,7 +6,7 @@ from car_solver.config import (
     Config, MassConfig, GeometryConfig, WheelConfig, MaterialConfig,
     SafetyConfig, ObjectiveWeights, DynamicLoads, SIMPConfig, ManufacturingConfig,
 )
-from car_solver.monocoque import MonocoqueTub, torsion_load_case
+from car_solver.monocoque import MonocoqueTub, torsion_load_case, bending_load_case
 
 
 def _test_config() -> Config:
@@ -140,18 +140,28 @@ def test_build_solver_uses_tuned_params():
 
 # --- Torsion ---
 
-def test_torsion_converges():
-    """Torsion load case should converge with positive compliance."""
+def _fast_config() -> Config:
+    """Config with loose tolerance and few iterations for test speed."""
     cfg = _test_config()
-    # Use small grid and few iterations for speed
     simp = SIMPConfig(3.0, 0.30, 0.05, 20, 1.5)
-    cfg_fast = Config(
+    return Config(
         mass=cfg.mass, geometry=cfg.geometry, wheels=cfg.wheels,
         material=cfg.material, safety=cfg.safety, weights=cfg.weights,
         loads=cfg.loads, simp=simp, manufacturing=cfg.manufacturing,
     )
-    densities, history, tub = torsion_load_case(cfg_fast, element_size_mm=100.0)
+
+
+def test_torsion_converges():
+    """Torsion load case should converge with positive compliance."""
+    densities, history, tub = torsion_load_case(_fast_config(), element_size_mm=100.0)
     assert len(history) > 1
     assert all(c > 0 for c in history)
-    # Obstacles should stay void
+    assert np.all(densities[tub.obstacle] < 0.01)
+
+
+def test_bending_converges():
+    """Bending load case should converge with positive compliance."""
+    densities, history, tub = bending_load_case(_fast_config(), element_size_mm=100.0)
+    assert len(history) > 1
+    assert all(c > 0 for c in history)
     assert np.all(densities[tub.obstacle] < 0.01)
