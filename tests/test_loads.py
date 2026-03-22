@@ -1,7 +1,5 @@
 """Tests for load case calculator."""
 
-import numpy as np
-
 from car_solver.config import (
     Config, MassConfig, GeometryConfig, WheelConfig, MaterialConfig,
     SafetyConfig, ObjectiveWeights, DynamicLoads, SIMPConfig, ManufacturingConfig,

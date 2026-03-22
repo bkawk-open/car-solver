@@ -163,7 +163,9 @@ class Config:
 def load_config() -> Config:
     """Load configuration from .env file."""
     env = _load_env()
-    g = lambda key, cast=float: _get(env, key, cast)
+
+    def g(key, cast=float):
+        return _get(env, key, cast)
 
     return Config(
         mass=MassConfig(

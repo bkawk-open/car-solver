@@ -167,7 +167,7 @@ def print_load_summary(cases: LoadCases, cfg: Config) -> None:
     print(f"Total weight: {sc.total_n:.0f} N")
     print(f"Front bias: {cfg.geometry.cog_front_bias:.0%}")
 
-    print(f"\n--- Static Corner Weights ---")
+    print("\n--- Static Corner Weights ---")
     print(f"  Front left:  {sc.front_left_n:>8.1f} N")
     print(f"  Front right: {sc.front_right_n:>8.1f} N")
     print(f"  Rear left:   {sc.rear_left_n:>8.1f} N")
@@ -184,18 +184,18 @@ def print_load_summary(cases: LoadCases, cfg: Config) -> None:
         print(f"  Lateral:       {corner.lateral_n:>8.1f} N  ({cfg.loads.lateral_g:.1f}g)")
         print(f"  Longitudinal:  {corner.longitudinal_n:>8.1f} N  ({cfg.loads.braking_g:.1f}g)")
 
-    print(f"\n--- Torsion Load Case ---")
+    print("\n--- Torsion Load Case ---")
     print(f"  Front left:  {cases.torsion.front_left_n:>+8.1f} N")
     print(f"  Front right: {cases.torsion.front_right_n:>+8.1f} N")
     print(f"  Target stiffness: {cases.torsion.target_stiffness_nm_per_deg:.0f} Nm/deg")
 
-    print(f"\n--- Bending Load Case ---")
+    print("\n--- Bending Load Case ---")
     print(f"  Total vertical: {cases.bending.total_vertical_n:>8.1f} N")
     print(f"  Front fraction: {cases.bending.front_fraction:.0%}")
     print(f"  Rear fraction:  {cases.bending.rear_fraction:.0%}")
 
     # Safety-factored loads
-    print(f"\n--- Safety-Factored Design Loads ---")
+    print("\n--- Safety-Factored Design Loads ---")
     sf = cfg.safety.general
     sf_susp = cfg.safety.suspension_pickup
     print(f"  General structure (SF={sf:.1f}):")
